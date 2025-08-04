@@ -14,6 +14,7 @@ from peft import PeftModel
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
+import traceback
 
 load_dotenv(override=True)
 access_token = os.getenv("HF_TOKEN")
@@ -55,7 +56,7 @@ SYSTEM_PROMPT = "You are a seasoned stock market analyst. Your task is to list t
 
 
 def print_gpu_utilization():
-    
+
     try:
         nvmlInit()
         handle = nvmlDeviceGetHandleByIndex(0)
@@ -281,29 +282,31 @@ def construct_prompt(ticker, curday, n_weeks, use_basics):
 
 
 def predict(ticker, date, n_weeks, use_basics):
+    try:
+        print_gpu_utilization()
 
-    print_gpu_utilization()
+        info, prompt = construct_prompt(ticker, date, n_weeks, use_basics)
 
-    info, prompt = construct_prompt(ticker, date, n_weeks, use_basics)
-      
-    inputs = tokenizer(
-        prompt, return_tensors='pt', padding=False
-    )
-    inputs = {key: value.to(model.device) for key, value in inputs.items()}
+        inputs = tokenizer(prompt, return_tensors='pt', padding=False)
+        inputs = {key: value.to(model.device) for key, value in inputs.items()}
 
-    print("Inputs loaded onto devices.")
-        
-    res = model.generate(
-        **inputs, max_length=6000, do_sample=True,
-        eos_token_id=tokenizer.eos_token_id,
-        use_cache=True, streamer=streamer
-    )
-    output = tokenizer.decode(res[0], skip_special_tokens=True)
-    answer = re.sub(r'.*\[/INST\]\s*', '', output, flags=re.DOTALL)
+        print("Inputs loaded onto devices.")
 
-    torch.cuda.empty_cache()
-    
-    return info, answer
+        res = model.generate(
+            **inputs, max_length=6000, do_sample=True,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True, streamer=streamer
+        )
+        output = tokenizer.decode(res[0], skip_special_tokens=True)
+        answer = re.sub(r'.*\[/INST\]\s*', '', output, flags=re.DOTALL)
+
+        torch.cuda.empty_cache()
+        return info, answer
+
+    except Exception as e:
+        print("❌ Error during prediction:")
+        traceback.print_exc()
+        return "Error", f"❌ {str(e)}"
 
 
 demo = gr.Interface(
@@ -351,4 +354,4 @@ For more detailed and customized implementation, refer to our FinGPT project: <h
 """
 )
 
-demo.launch(share=True)
+demo.launch(share=True, debug=True)
