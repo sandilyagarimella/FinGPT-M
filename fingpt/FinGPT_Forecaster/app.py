@@ -138,220 +138,198 @@ def get_company_prompt(symbol):
     if not profile:
         raise gr.Error(f"Failed to find company profile for symbol {symbol} from finnhub!")
         
-    company_template = "[Company Introduction]:\n\n{name} is a leading entity in the {finnhubIndustry} sector. Incorporated and publicly traded since {ipo}, the company has established its reputation as one of the key players in the market. As of today, {name} has a market capitalization of {marketCapitalization:.2f} in {currency}, with {shareOutstanding:.2f} shares outstanding." \
-        "\n\n{name} operates primarily in the {country}, trading under the ticker {ticker} on the {exchange}. As a dominant force in the {finnhubIndustry} space, the company continues to innovate and drive progress within the industry."
-
+    company_template = (
+        "[Company Introduction]:\n\n{name} is a leading entity in the {finnhubIndustry} sector. "
+        "Incorporated and publicly traded since {ipo}, the company has established its reputation "
+        "as one of the key players in the market. As of today, {name} has a market capitalization of "
+        "{marketCapitalization:.2f} in {currency}, with {shareOutstanding:.2f} shares outstanding.\n\n"
+        "{name} operates primarily in the {country}, trading under the ticker {ticker} on the {exchange}. "
+        "As a dominant force in the {finnhubIndustry} space, the company continues to innovate and drive progress."
+    )
     formatted_str = company_template.format(**profile)
     
     return formatted_str
-
-
-def get_prompt_by_row(symbol, row):
-    try:
-        start_date = row['Start Date'].strftime('%Y-%m-%d') if not isinstance(row['Start Date'], str) else row['Start Date']
-        end_date = row['End Date'].strftime('%Y-%m-%d') if not isinstance(row['End Date'], str) else row['End Date']
-
-        # Safe extraction
-        start_price = row['Start Price']
-        end_price = row['End Price']
-
-        # Handle Series or scalar
-        if isinstance(start_price, pd.Series):
-            start_price = start_price.iloc[0]
-        if isinstance(end_price, pd.Series):
-            end_price = end_price.iloc[0]
-
-        start_price = float(start_price) if pd.notna(start_price) else 0.0
-        end_price = float(end_price) if pd.notna(end_price) else 0.0
-
-        term = 'increased' if end_price > start_price else 'decreased'
-
-        head = "From {} to {}, {}'s stock price {} from {:.2f} to {:.2f}. Company news during this period are listed below:\n\n".format(
-            start_date, end_date, symbol, term, start_price, end_price
-        )
-
-        news = json.loads(row["News"])
-        news = [
-            "[Headline]: {}\n[Summary]: {}\n".format(n['headline'], n['summary'])
-            for n in news
-            if n['date'][:8] <= end_date.replace('-', '') and
-            not n['summary'].startswith("Looking for stock market analysis")
-        ]
-
-        basics = json.loads(row.get('Basics', '{}'))
-        if basics:
-            basics_str = "Some recent basic financials of {}, reported at {}, are presented below:\n\n[Basic Financials]:\n\n".format(
-                symbol, basics.get('period', 'N/A')) + \
-                "\n".join(f"{k}: {v}" for k, v in basics.items() if k != 'period')
-        else:
-            basics_str = "[Basic Financials]:\n\nNo basic financial reported."
-
-        return head, news, basics_str
-
-    except Exception as e:
-        print("Error in get_prompt_by_row:", e)
-        raise gr.Error(f"Failed to process row for symbol {symbol}: {e}")
-
-
-def sample_news(news, k=5):
-    
-    return [news[i] for i in sorted(random.sample(range(len(news)), k))]
-
-
-def get_current_basics(symbol, curday):
-
-    basic_financials = finnhub_client.company_basic_financials(symbol, 'all')
-    if not basic_financials['series']:
-        raise gr.Error(f"Failed to find basic financials for symbol {symbol} from finnhub!")
-        
-    final_basics, basic_list, basic_dict = [], [], defaultdict(dict)
-    
-    for metric, value_list in basic_financials['series']['quarterly'].items():
-        for value in value_list:
-            basic_dict[value['period']].update({metric: value['v']})
-
-    for k, v in basic_dict.items():
-        v.update({'period': k})
-        basic_list.append(v)
-        
-    basic_list.sort(key=lambda x: x['period'])
-    
-    for basic in basic_list[::-1]:
-        if basic['period'] <= curday:
-            break
-            
-    return basic
-    
-
-def get_all_prompts_online(symbol, data, curday, with_basics=True):
-
-    company_prompt = get_company_prompt(symbol)
-
-    prev_rows = []
-
-    for row_idx, row in data.iterrows():
-        head, news, _ = get_prompt_by_row(symbol, row)
-        prev_rows.append((head, news, None))
-        
-    prompt = ""
-    for i in range(-len(prev_rows), 0):
-        prompt += "\n" + prev_rows[i][0]
-        sampled_news = sample_news(
-            prev_rows[i][1],
-            min(5, len(prev_rows[i][1]))
-        )
-        if sampled_news:
-            prompt += "\n".join(sampled_news)
-        else:
-            prompt += "No relative news reported."
-        
-    period = "{} to {}".format(curday, n_weeks_before(curday, -1))
-    
-    if with_basics:
-        basics = get_current_basics(symbol, curday)
-        basics = "Some recent basic financials of {}, reported at {}, are presented below:\n\n[Basic Financials]:\n\n".format(
-            symbol, basics['period']) + "\n".join(f"{k}: {v}" for k, v in basics.items() if k != 'period')
-    else:
-        basics = "[Basic Financials]:\n\nNo basic financial reported."
-
-    info = company_prompt + '\n' + prompt + '\n' + basics
-    prompt = info + f"\n\nBased on all the information before {curday}, let's first analyze the positive developments and potential concerns for {symbol}. Come up with 2-4 most important factors respectively and keep them concise. Most factors should be inferred from company related news. " \
-        f"Then make your prediction of the {symbol} stock price movement for next week ({period}). Provide a summary analysis to support your prediction."
-        
-    return info, prompt
-
-
+# ===== Prompt construction =====
 def construct_prompt(ticker, curday, n_weeks, use_basics):
-
-    try:
-        steps = [n_weeks_before(curday, n) for n in range(n_weeks + 1)][::-1]
-    except Exception:
-        raise gr.Error(f"Invalid date {curday}!")
-        
+    steps = [n_weeks_before(curday, n) for n in range(n_weeks + 1)][::-1]
     data = get_stock_data(ticker, steps)
     data = get_news(ticker, data)
-    data['Basics'] = [json.dumps({})] * len(data)
-    # print(data)
-    
-    info, prompt = get_all_prompts_online(ticker, data, curday, use_basics)
-    
-    prompt = B_INST + B_SYS + SYSTEM_PROMPT + E_SYS + prompt + E_INST
-    # print(prompt)
-    
-    return info, prompt
+    company_prompt = get_company_prompt(ticker)
+    prompt = B_INST + B_SYS + SYSTEM_PROMPT + E_SYS + company_prompt + E_INST
+    return company_prompt, prompt
 
 
-def predict(ticker, date, n_weeks, use_basics):
+def run_model(prompt):
+    inputs = tokenizer(prompt, return_tensors='pt', padding=False)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    res = model.generate(**inputs, max_length=4000, do_sample=True, eos_token_id=tokenizer.eos_token_id)
+    output = tokenizer.decode(res[0], skip_special_tokens=True)
+    return re.sub(r'.*\[/INST\]\s*', '', output, flags=re.DOTALL)
+
+# ===== Model prediction =====
+def predict(ticker, date_val, n_weeks, use_basics, chart_metadata=None):
+    print_gpu_utilization()
+    company_info, prompt = construct_prompt(ticker, date_val, n_weeks, use_basics)
+    inputs = tokenizer(prompt, return_tensors='pt', padding=False)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    res = model.generate(
+        **inputs, max_length=4000, do_sample=True,
+        eos_token_id=tokenizer.eos_token_id, streamer=streamer
+    )
+    output = tokenizer.decode(res[0], skip_special_tokens=True)
+    answer = re.sub(r'.*\[/INST\]\s*', '', output, flags=re.DOTALL)
+    torch.cuda.empty_cache()
+
+    chart_section = ""
+    if chart_metadata:
+        price_min = chart_metadata.get("price_range", {}).get("min")
+        price_max = chart_metadata.get("price_range", {}).get("max")
+        vol = chart_metadata.get("ohlc", {}).get("V")
+        if price_min and price_max:
+            chart_section += f"\n📊 Price Range: ${price_min} – ${price_max}"
+        if vol:
+            chart_section += f"\n📊 Volume: ~{vol:,} shares traded"
+
+    final_output = (
+        f"🏢 **Company Overview:**\n{company_info}\n\n"
+        f"{answer.strip()}\n"
+        f"{chart_section}\n\n"
+        f"📄 _Source: FinGPT forecast integrating news, financials, and chart metadata._"
+    )
+    return final_output
+
+def predict_from_json(json_path, use_basics=True):
+    with open(json_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    ticker = metadata.get("ticker")
+    sessions = metadata.get("sessions", [])
+
+    # Pick first valid YYYY-MM-DD date from sessions
+    extracted_date = None
+    for s in sessions:
+        if "date" in s and re.match(r"\d{4}-\d{2}-\d{2}", s["date"]):
+            extracted_date = s["date"]
+            break
+    if not extracted_date:
+        extracted_date = get_curday()
+
+    # Chart metadata from JSON
+    chart_metadata = {
+        "price_range": {"min": metadata.get("price_range", [None, None])[0],
+                        "max": metadata.get("price_range", [None, None])[1]},
+        "ohlc": metadata.get("ohlc", {})
+    }
+
+    # Optional: company info from Finnhub
     try:
-        print_gpu_utilization()
+        company_info = get_company_prompt(ticker)
+    except:
+        company_info = f"[Company Introduction]:\n\nNo profile data available for {ticker}"
 
-        info, prompt = construct_prompt(ticker, date, n_weeks, use_basics)
+    # Get stock data from yfinance for extracted date (±3 days window)
+    start_dt = (datetime.strptime(extracted_date, "%Y-%m-%d") - timedelta(days=3)).strftime("%Y-%m-%d")
+    end_dt = (datetime.strptime(extracted_date, "%Y-%m-%d") + timedelta(days=3)).strftime("%Y-%m-%d")
 
-        inputs = tokenizer(prompt, return_tensors='pt', padding=False)
-        inputs = {key: value.to(model.device) for key, value in inputs.items()}
+    try:
+        stock_data = yf.download(ticker, start=start_dt, end=end_dt)
+        if not stock_data.empty:
+            stock_summary = f"\nStock close prices around {extracted_date}:\n" + \
+                            "\n".join([f"{idx.date()}: {row['Close']:.2f}"
+                                      for idx, row in stock_data.iterrows()])
+        else:
+            stock_summary = "\nNo stock data available."
+    except:
+        stock_summary = "\nFailed to fetch stock data."
 
-        print("Inputs loaded onto devices.")
+    # Run model prediction (pass extracted date instead of n_weeks logic)
+    forecast = predict(ticker, extracted_date, n_weeks=1, use_basics=use_basics, chart_metadata=chart_metadata)
 
-        res = model.generate(
-            **inputs, max_length=6000, do_sample=True,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=True, streamer=streamer
+    # Final combined output
+    return (
+        f"🏢 **Company Overview:**\n{company_info}\n\n"
+        f"📅 **Date Used for Analysis:** {extracted_date}\n"
+        f"{stock_summary}\n\n"
+        f"{forecast}"
+    )
+# ===== Run OCR + YOLO for image =====
+sys.path.append('/content/FinGPT-M/fingpt/stock_chart_trends_analysis')
+from StockChart_Trend_Prediction import StockChartMetadataExtractor, StockChartTrendPredictor, combine_metadata_and_predictions
+
+def run_chart_analysis(image_path):
+    model_path = r"/content/FinGPT-M/fingpt/stock_chart_trends_analysis/best.pt"
+    metadata_extractor = StockChartMetadataExtractor(image_path)
+    metadata_extractor.save_metadata_to_json("metadata.json")
+    stock_chart_predictor = StockChartTrendPredictor(model_path)
+    output, _ = stock_chart_predictor.predict(image_path)
+    stock_chart_predictor.save_predictions_to_json(output, 'predictions.json')
+    combine_metadata_and_predictions('metadata.json', output, 'final_output.json')
+    for file in ['metadata.json', 'predictions.json']:
+        if os.path.exists(file):
+            os.remove(file)
+    return "final_output.json"
+
+# ===== Gradio chatbot =====
+with gr.Blocks() as demo:
+    gr.Markdown("## 📊 FinGPT-Forecaster Chatbot")
+    chatbot = gr.Chatbot(label="FinGPT", height=500)
+    with gr.Row():
+        query_box = gr.Textbox(
+            placeholder="Ask: 'What's the prediction for TSLA after 2025-07-25 for past 2 weeks using financials?'",
+            show_label=False, scale=5
         )
-        output = tokenizer.decode(res[0], skip_special_tokens=True)
-        answer = re.sub(r'.*\[/INST\]\s*', '', output, flags=re.DOTALL)
+        image_upload = gr.Image(type="pil", label=None, scale=1)
 
-        torch.cuda.empty_cache()
-        return info, answer
+    def chat_handler(user_input, chat_history, image=None):
+      chat_history.append((user_input, None))
 
-    except Exception as e:
-        print("❌ Error during prediction:")
-        traceback.print_exc()
-        return "Error", f"❌ {str(e)}"
+      try:
+          if image:
+              # Force image mode: ignore textbox ticker/date
+              image_path = "uploaded_chart.png"
+              image.save(image_path)
+
+              # Run OCR + YOLO → JSON
+              json_path = run_chart_analysis(image_path)
+
+              # Run JSON-based prediction
+              formatted_output = predict_from_json(json_path, use_basics=True)
+
+              # Replace chat message
+              # chat_history[-1] = (f"[Image: {os.path.basename(image_path)}]", formatted_output)
+              # original_filename = getattr(image, 'name', 'Uploaded Image')
+            #   chat_history[-1] = (f"[Image: {os.path.basename(original_filename)}]", formatted_output)
+              chat_history[-1] = (image_path, formatted_output)
 
 
-demo = gr.Interface(
-    predict,
-    inputs=[
-        gr.Textbox(
-            label="Ticker",
-            value="AAPL",
-            info="Companys from Dow-30 are recommended"
-        ),
-        gr.Textbox(
-            label="Date",
-            value=get_curday,
-            info="Date from which the prediction is made, use format yyyy-mm-dd"
-        ),
-        gr.Slider(
-            minimum=1,
-            maximum=4,
-            value=3,
-            step=1,
-            label="n_weeks",
-            info="Information of the past n weeks will be utilized, choose between 1 and 4"
-        ),
-        gr.Checkbox(
-            label="Use Latest Basic Financials",
-            value=False,
-            info="If checked, the latest quarterly reported basic financials of the company is taken into account."
-        )
-    ],
-    outputs=[
-        gr.Textbox(
-            label="Information"
-        ),
-        gr.Textbox(
-            label="Response"
-        )
-    ],
-    title="FinGPT-Forecaster",
-    description="""FinGPT-Forecaster takes random market news and optional basic financials related to the specified company from the past few weeks as input and responds with the company's **positive developments** and **potential concerns**. Then it gives out a **prediction** of stock price movement for the coming week and its **analysis** summary.
-This model is finetuned on Llama2-7b-chat-hf with LoRA on the past year's DOW30 market data. Inference in this demo uses fp16 and **welcomes any ticker symbol**.
-Company profile & Market news & Basic financials & Stock prices are retrieved using **yfinance & finnhub**.
-This is just a demo showing what this model is capable of. Results inferred from randomly chosen news can be strongly biased.
-For more detailed and customized implementation, refer to our FinGPT project: <https://github.com/AI4Finance-Foundation/FinGPT>
-**Disclaimer: Nothing herein is financial advice, and NOT a recommendation to trade real money. Please use common sense and always first consult a professional before trading or investing.**
-"""
-)
+              # Return with cleared textbox
+              return "", chat_history, None
+
+          else:
+              # Text mode only
+              words = re.findall(r'\b[A-Z.]{2,6}\b', user_input.upper())
+              ticker = next((w for w in words if w.isupper()), "AAPL")
+              date_match = re.search(r"\d{4}-\d{2}-\d{2}", user_input)
+              date_val = date_match.group(0) if date_match else get_curday()
+              n_weeks_match = re.search(r"past (\d+) week", user_input.lower())
+              n_weeks = int(n_weeks_match.group(1)) if n_weeks_match else 3
+              use_basics = bool(re.search(r"(financial|basic)", user_input.lower()))
+
+              formatted_output = predict(ticker, date_val, n_weeks, use_basics)
+
+              chat_history[-1] = (user_input, formatted_output)
+              return "", chat_history, None
+
+      except Exception as e:
+          chat_history[-1] = (user_input, f"❌ Error: {str(e)}")
+          return "", chat_history, None
+
+
+    query_box.submit(fn=chat_handler,
+                     inputs=[query_box, chatbot, image_upload],
+                     outputs=[query_box, chatbot, image_upload])
+    image_upload.change(fn=chat_handler,
+                        inputs=[query_box, chatbot, image_upload],
+                        outputs=[query_box, chatbot, image_upload])
 
 demo.launch(share=True, debug=True)
