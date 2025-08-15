@@ -1,3 +1,5 @@
+# app.py — FinGPT-M UI (LLM Summary + Forecast, JSON download + toggle preview)
+
 import os
 import re
 import json
@@ -45,16 +47,10 @@ if not FINNHUB_API_KEY:
 # ── Create the client with the **string** key
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
-
 # ─────────────────────────────────────────────────────────────
 # Imports from your pipeline
 # ─────────────────────────────────────────────────────────────
 from StockChart_Trend_Prediction import StockChartTrendPredictor, StockChartMetadataExtractor
-
-# ─────────────────────────────────────────────────────────────
-# Finnhub client (for news)
-# ─────────────────────────────────────────────────────────────
-# finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
 
 # ─────────────────────────────────────────────────────────────
 # LLM (Local): Llama-2-7B-Chat + FinGPT LoRA
@@ -71,17 +67,17 @@ OFFLOAD_DIR = r"E:/FinGPT/offload"
 if torch.cuda.is_available():
     dtype = torch.bfloat16  # safer than fp16 for many CUDA setups
     device_map = "auto"     # let accelerate map layers to GPU
-    # Configure 4-bit quantization
+    # Configure 4-bit quantization (keep False if you prefer)
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=False, # Set to False to disable 4-bit quantization
+        load_in_4bit=False,  # set True if you want speed
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
     )
 else:
-    dtype = torch.float32   # CPU needs fp32 (fp16 on CPU will crash)
+    dtype = torch.float32
     device_map = "cpu"
-    bnb_config = None # No quantization on CPU
+    bnb_config = None
 
 print("• Loading base model (first run can take a while)…")
 base_model = AutoModelForCausalLM.from_pretrained(
@@ -92,7 +88,7 @@ base_model = AutoModelForCausalLM.from_pretrained(
     device_map=device_map,
     torch_dtype=dtype,
     offload_folder=OFFLOAD_DIR,
-    quantization_config=bnb_config if torch.cuda.is_available() else None, # Apply quantization config if GPU is available
+    quantization_config=bnb_config if torch.cuda.is_available() else None,
 )
 
 print("• Applying LoRA adapter…")
@@ -135,11 +131,14 @@ def _between_markers(text: str) -> str:
 # Helpers
 # ─────────────────────────────────────────────────────────────
 def _yf_symbol(ticker: str, exchange: Optional[str]) -> str:
-    if not ticker: return ticker
+    if not ticker:
+        return ticker
     t = ticker.upper().replace(" ", "")
     ex = (exchange or "").upper()
-    if ex in {"NSE","NSEI","INDIA"} and not t.endswith(".NS"): return f"{t}.NS"
-    if ex == "BSE" and not t.endswith(".BO"): return f"{t}.BO"
+    if ex in {"NSE", "NSEI", "INDIA"} and not t.endswith(".NS"):
+        return f"{t}.NS"
+    if ex == "BSE" and not t.endswith(".BO"):
+        return f"{t}.BO"
     return t
 
 def ensure_min_ohlc(final_output: Dict[str, Any]) -> None:
@@ -170,7 +169,6 @@ def ensure_min_ohlc(final_output: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[ensure_min_ohlc] yfinance fallback skipped: {e}")
 
-
 def get_curday() -> str:
     return date.today().strftime("%Y-%m-%d")
 
@@ -189,68 +187,124 @@ def parse_query(q: str) -> Tuple[Optional[str], Optional[str]]:
 
 from finnhub import FinnhubAPIException
 
-def _candidate_symbols_for_news(ticker: str, exchange: Optional[str]) -> List[str]:
-    t = (ticker or "").upper().replace(" ", "")
-    ex = (exchange or "").upper()
-    cands = [t]
-    # NSE/BSE common formats for Finnhub:
-    if ex in {"NSE", "NSEI", "INDIA"} or t.endswith(".NS"):
-        base = t.replace(".NS", "")
-        cands = [f"{base}.NS", f"NSE:{base}", base] + cands
-    if ex in {"BSE"} or t.endswith(".BO"):
-        base = t.replace(".BO", "")
-        cands = [f"{base}.BO", f"BSE:{base}", base] + cands
-    # Dedup, keep order
-    seen, ordered = set(), []
-    for s in cands:
-        if s and s not in seen:
-            seen.add(s); ordered.append(s)
-    return ordered
+def _clean_item(n: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Normalize/clean a single Finnhub news item. Returns None if it's obvious boilerplate."""
+    if not n:
+        return None
+    if str(n.get("summary", "")).startswith("Looking for stock market analysis"):
+        return None
 
-def get_company_news(symbol: str, start_date: str, end_date: str, exchange: Optional[str] = None) -> List[Dict[str, str]]:
-    if not symbol:
-        return []
-    items = []
-    for sym in _candidate_symbols_for_news(symbol, exchange):
-        try:
-            raw = finnhub_client.company_news(sym, _from=start_date, to=end_date)
-            if raw:
-                items = raw
-                break
-        except FinnhubAPIException as e:
-            print(f"[WARN] Finnhub({sym}) failed: {e}")
+    ts = n.get("datetime") or n.get("time") or n.get("publishedTime")
+    try:
+        dt = datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+    except Exception:
+        dt = ""
+
+    return {
+        "date": dt,
+        "headline": n.get("headline") or n.get("title") or "",
+        "summary": n.get("summary") or n.get("description") or "",
+        "source": n.get("source") or n.get("site") or "",
+        "url": n.get("url") or n.get("link") or "",
+    }
+
+def _dedupe_news(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    seen = set()
+    out = []
+    for it in items:
+        key = it.get("url") or (it.get("headline"), it.get("date"))
+        if key in seen:
             continue
-
-    cleaned = [
-        {
-            "date": datetime.fromtimestamp(n["datetime"]).strftime("%Y-%m-%d %H:%M:%S"),
-            "headline": n.get("headline", ""),
-            "summary": n.get("summary", ""),
-            "source": n.get("source", ""),
-            "url": n.get("url", ""),
-        }
-        for n in (items or [])
-        if not str(n.get("summary", "")).startswith("Looking for stock market analysis")
-    ]
-    # Top 8, dedup by headline
-    seen, out = set(), []
-    for r in cleaned:
-        if r["headline"] not in seen:
-            seen.add(r["headline"])
-            out.append(r)
-        if len(out) >= 8:
-            break
+        seen.add(key)
+        out.append(it)
     return out
 
-def news_for_window(symbol: str, anchor_day: str, exchange: Optional[str], weeks: int = 1) -> List[Dict[str, str]]:
+def _fallback_general_news_filter(general_news: List[Dict[str, Any]], ticker: str, company_name: Optional[str]) -> List[Dict[str, str]]:
+    """Filter general news by presence of ticker/company in headline/summary."""
+    t = (ticker or "").upper()
+    cn = (company_name or "").lower()
+    keep = []
+    for n in general_news or []:
+        head = (n.get("headline") or n.get("title") or "")
+        summ = (n.get("summary") or n.get("description") or "")
+        hay = f"{head}\n{summ}"
+        if t and (t in head.upper() or t in summ.upper()):
+            c = _clean_item(n)
+            if c: keep.append(c)
+            continue
+        if cn and (cn in hay.lower()):
+            c = _clean_item(n)
+            if c: keep.append(c)
+    return keep
+
+def get_company_news(symbol: str, start_date: str, end_date: str) -> List[Dict[str, str]]:
+    """Primary: company_news for a specific symbol."""
+    try:
+        raw = finnhub_client.company_news(symbol, _from=start_date, to=end_date)
+    except Exception as e:
+        print(f"[news] company_news error: {e}")
+        raw = []
+    items = []
+    for n in raw or []:
+        c = _clean_item(n)
+        if c: items.append(c)
+    return items
+
+def get_stock_news(symbol: str, start_date: str, end_date: str) -> List[Dict[str, str]]:
+    """Fallback: stock_news for symbol in a date window (if available on your plan)."""
+    try:
+        raw = finnhub_client.stock_news(symbol, _from=start_date, to=end_date)
+    except Exception as e:
+        print(f"[news] stock_news error: {e}")
+        raw = []
+    items = []
+    for n in raw or []:
+        c = _clean_item(n)
+        if c: items.append(c)
+    return items
+
+def get_general_news_filtered(ticker: str, company_name: Optional[str]) -> List[Dict[str, str]]:
+    """Last resort: general market news, then filter by ticker/company mentions."""
+    try:
+        raw = finnhub_client.general_news("general")
+    except Exception as e:
+        print(f"[news] general_news error: {e}")
+        raw = []
+    return _fallback_general_news_filter(raw or [], ticker, company_name)
+
+def news_for_window(symbol: str, anchor_day: str, weeks: int = 1, company_name: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Robust multi-stage:
+      1) company_news for last N weeks
+      2) company_news for last 30 days
+      3) stock_news for last 30 days
+      4) general news filtered by ticker/company
+    """
+    # Stage 1: N-week window
     try:
         end_dt = datetime.strptime(anchor_day, "%Y-%m-%d")
     except Exception:
         end_dt = datetime.today()
     start_dt = end_dt - timedelta(days=7 * weeks)
-    # Small guard: long weekends/no news
-    return get_company_news(symbol, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), exchange)
 
+    win_1 = get_company_news(symbol, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
+    if win_1:
+        return _dedupe_news(win_1)
+
+    # Stage 2: widen to 30 days
+    start_30 = end_dt - timedelta(days=30)
+    win_2 = get_company_news(symbol, start_30.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
+    if win_2:
+        return _dedupe_news(win_2)
+
+    # Stage 3: stock_news 30 days
+    win_3 = get_stock_news(symbol, start_30.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
+    if win_3:
+        return _dedupe_news(win_3)
+
+    # Stage 4: general news filtered
+    win_4 = get_general_news_filtered(symbol, company_name)
+    return _dedupe_news(win_4)
 
 def simple_sentiment_from_patterns(preds: List[Dict[str, Any]]) -> str:
     if not preds:
@@ -267,7 +321,7 @@ def simple_sentiment_from_patterns(preds: List[Dict[str, Any]]) -> str:
     return "Positive" if score > 0 else "Negative" if score < 0 else "Neutral"
 
 # ─────────────────────────────────────────────────────────────
-# Local text generation (replaces old HTTP-based generate_text)
+# Local text generation
 # ─────────────────────────────────────────────────────────────
 def _truncate_at_stops(text: str, stops: List[str]) -> str:
     if not stops:
@@ -285,14 +339,12 @@ def generate_text(
     temperature: float = 0.2,
     top_p: float = 0.95,
     stop: Optional[List[str]] = None,
-    timeout: int = 60,  # kept for API compat; unused locally
+    timeout: int = 60,
 ) -> str:
     stop = stop or []
-
     inputs = tokenizer(prompt, return_tensors="pt")
     if torch.cuda.is_available():
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=temperature > 0,
@@ -301,19 +353,20 @@ def generate_text(
         repetition_penalty=1.05,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
-        streamer=None,  # set to streamer to print live to console
+        streamer=None,
     )
-
     with torch.no_grad():
         output_ids = model.generate(**inputs, **gen_kwargs)
-
     full = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     prompt_text = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=True)
     generated = full[len(prompt_text):]
     generated = _truncate_at_stops(generated, stop)
     return generated.strip()
 
-# Fallback deterministic summary
+# ─────────────────────────────────────────────────────────────
+# Summary (sentence-style bullets) + fallback
+# ─────────────────────────────────────────────────────────────
+
 # Pattern explanation map
 PATTERN_EXPLANATIONS = {
     "evening_star_fall": "a bearish reversal signal, often suggesting that an uptrend may be coming to an end.",
@@ -327,7 +380,6 @@ PATTERN_EXPLANATIONS = {
     "golden_cross": "a bullish signal that occurs when the short-term moving average crosses above the long-term moving average.",
     "death_cross": "a bearish signal that occurs when the short-term moving average crosses below the long-term moving average."
 }
-
 
 def summarize_image(final_output: Dict[str, Any], sentiment: str) -> str:
     tkr = final_output.get("ticker") or final_output.get("company_ticker") or "—"
@@ -345,12 +397,10 @@ def summarize_image(final_output: Dict[str, Any], sentiment: str) -> str:
     )
     pct = f"{((pr[1] - pr[0]) / pr[0] * 100):.1f}%" if pr[0] and pr[1] and pr[0] else "—"
 
-    # Reasoning for first detected pattern
     pattern_reason = ""
     if patterns_list and patterns_list[0] in PATTERN_EXPLANATIONS:
         pattern_reason = f" This pattern is {PATTERN_EXPLANATIONS[patterns_list[0]]}"
 
-    # Sentiment reasoning
     sentiment_reason = ""
     if sentiment.lower() == "positive":
         sentiment_reason = " This suggests buying momentum or market optimism."
@@ -366,9 +416,7 @@ def summarize_image(final_output: Dict[str, Any], sentiment: str) -> str:
         f"Identified chart patterns: **{patterns_str}**.{pattern_reason}",
         f"Overall market sentiment based on detected patterns is assessed as **{sentiment}**.{sentiment_reason}"
     ]
-
     return "### Image Summary\n" + "\n".join(f"- {s}" for s in sentences)
-
 
 def llm_brief_summary(final_output: Dict[str, Any], sentiment: str) -> str:
     ctx = {
@@ -380,31 +428,25 @@ def llm_brief_summary(final_output: Dict[str, Any], sentiment: str) -> str:
         "predictions": final_output.get("predictions"),
         "pattern_sentiment": sentiment,
     }
-
     sys_msg = (
         "You are a market analyst. Using ONLY the JSON, write 4–6 markdown bullet points "
         "where each bullet is a full sentence explaining the detail in plain language for a non-technical reader. "
         "Include reasoning for any detected chart patterns (what they usually indicate) and sentiment (what it implies). "
         "Avoid table-like label:value formats."
     )
-
     user_msg = f"[JSON]\n{json.dumps(ctx, indent=2)}\n\n{OUTPUT_BEGIN}\n- Sentence...\n- Sentence...\n{OUTPUT_END}"
     prompt = f"{B_SYS}{sys_msg}{E_SYS}{B_INST}{user_msg}{E_INST}"
 
     raw = generate_text(prompt, max_new_tokens=180, temperature=0.0, top_p=1.0, stop=[OUTPUT_END])
     summary = _between_markers(raw).strip()
     lines = [ln for ln in summary.splitlines() if ln.strip().startswith("- ")]
-
-    # Deterministic fallback if the LLM under-delivers
     if len(lines) < 4:
         return summarize_image(final_output, sentiment)
-
     return "### Image Summary\n" + "\n".join(lines)
 
-
-
-# ---------- Forecast helpers ----------
-
+# ─────────────────────────────────────────────────────────────
+# Forecast helpers (robust)
+# ─────────────────────────────────────────────────────────────
 def build_llm_prompt(final_output: Dict[str, Any], news_snippets: List[Dict[str, str]], require_patterns: bool = False):
     """
     Forecast prompt that works with OR without patterns.
@@ -419,7 +461,6 @@ def build_llm_prompt(final_output: Dict[str, Any], news_snippets: List[Dict[str,
         "predictions": (final_output.get("predictions") or []) if not require_patterns else final_output.get("predictions"),
         "date": final_output.get("date"),
     }
-
     news_text = "\n".join(
         f"- {n.get('date','')} | {n.get('headline','')} :: {n.get('summary','')[:200]}..."
         for n in (news_snippets or [])[:6]
@@ -432,21 +473,17 @@ def build_llm_prompt(final_output: Dict[str, Any], news_snippets: List[Dict[str,
         "If no chart patterns exist, rely on ticker/company, OHLC and price range, and any news context. "
         "Be specific but avoid guarantees/targets. No extra sections or links."
     )
-
     user_fenced = (
         f"[JSON]\n{json.dumps(ctx, indent=2)}\n\n"
         f"[NEWS]\n{news_text}\n\n"
         f"{OUTPUT_BEGIN}\n<Your answer here>\n{OUTPUT_END}"
     )
-
     user_unfenced = (
         f"[JSON]\n{json.dumps(ctx, indent=2)}\n\n"
         f"[NEWS]\n{news_text}\n\n"
         "Write the three sections now."
     )
-
     return system, user_fenced, user_unfenced
-
 
 def _baseline_forecast(final_output: Dict[str, Any]) -> str:
     tkr = final_output.get("ticker") or final_output.get("company_ticker") or "—"
@@ -476,7 +513,6 @@ def _baseline_forecast(final_output: Dict[str, Any]) -> str:
         "- Favor risk-managed entries around clear levels until stronger catalysts emerge.\n"
     )
 
-
 def llm_forecast_strong(final_output: Dict[str, Any], news_items: List[Dict[str, str]]) -> str:
     # 1) fenced attempt
     system, user_fenced, user_unfenced = build_llm_prompt(final_output, news_items, require_patterns=False)
@@ -495,7 +531,6 @@ def llm_forecast_strong(final_output: Dict[str, Any], news_items: List[Dict[str,
 
     # 3) deterministic fallback
     return _baseline_forecast(final_output)
-
 
 # ─────────────────────────────────────────────────────────────
 # Build final_output.json
@@ -578,7 +613,7 @@ def handle_request(query: str, image, do_news: bool = False):
         anchor_date = final_output.get("date") or get_curday()
         exchange = (final_output.get("exchange") or "").strip()
 
-        # Ensure OHLC exists so forecast has some context  ← NEW
+        # Ensure OHLC exists so forecast has context
         ensure_min_ohlc(final_output)
 
         # Sentiment from YOLO patterns
@@ -591,15 +626,19 @@ def handle_request(query: str, image, do_news: bool = False):
             print("LLM brief failed, using fallback:", e)
             summary_md = summarize_image(final_output, sentiment)
 
-        # News (optional)
-        BAD_TICKERS = {"N/A","NA","NONE","UNKNOWN","-",""}
+        # News (optional - only when toggle is ON)
+        BAD_TICKERS = {"N/A", "NA", "NONE", "UNKNOWN", "-", ""}
         has_valid_ticker = bool(ticker) and ticker.strip().upper() not in BAD_TICKERS
-        news_items = []
+        news_items: List[Dict[str, Any]] = []
         if do_news and has_valid_ticker:
-            news_items = news_for_window(ticker, anchor_date, exchange, weeks=1)
+            news_items = news_for_window(
+                ticker,
+                anchor_date,
+                weeks=1,
+                company_name=final_output.get("company_name"),
+            )
 
-        # Forecast (ALWAYS run if we have a ticker; patterns are optional)  ← CHANGED
-        prompt = build_llm_prompt(final_output, news_items, require_patterns=False)  # ← CHANGED
+        # Forecast (ALWAYS run if we have a ticker; patterns are optional)
         forecast_md = llm_forecast_strong(final_output, news_items)
 
         # Save JSON for Download
@@ -618,9 +657,7 @@ def handle_request(query: str, image, do_news: bool = False):
         traceback.print_exc()
         raise gr.Error(f"Failed to process request: {e}")
 
-
-
-def chat_handle_turn_pairs(history_pairs, user_text: str, user_files: Optional[List[str]]):
+def chat_handle_turn_pairs(history_pairs, user_text: str, user_files: Optional[List[str]], do_news: bool = False):
     """
     Orchestrates a single chat turn.
     - Appends the user's message to the (user, assistant) tuple list
@@ -649,7 +686,7 @@ def chat_handle_turn_pairs(history_pairs, user_text: str, user_files: Optional[L
     history_pairs = history_pairs + [(user_msg, None)]
 
     # Run the core pipeline
-    summary_md, sentiment, forecast_md, final_json_str, news_df, json_path = handle_request(user_text, image_path)
+    summary_md, sentiment, forecast_md, final_json_str, news_df, json_path = handle_request(user_text, image_path, do_news=do_news)
 
     # Compose assistant bubble (what the Chatbot shows)
     assistant_md = f"{summary_md}\n\n---\n\n### Forecast & Analysis\n{forecast_md}"
@@ -659,7 +696,6 @@ def chat_handle_turn_pairs(history_pairs, user_text: str, user_files: Optional[L
 
     # Gradio expects: chat, summary, sentiment, forecast, json, news_df, download_path
     return history_pairs, summary_md, sentiment, forecast_md, final_json_str, news_df, json_path
-
 
 # Toggle handler for JSON accordion
 def _toggle(prev_open: bool):
@@ -686,7 +722,7 @@ with gr.Blocks(title="FinGPT-M — Chat") as demo:
 
     with gr.Row():
         with gr.Column(elem_classes=["compact-container"], scale=8):
-            gr.Markdown("## FinGPT-M\nChat with text or drop a **stock chart image**. I’ll extract metadata, run YOLO patterns, pull news, and generate a forecast.")
+            gr.Markdown("## FinGPT-M\nChat with text or drop a **stock chart image**. I’ll extract metadata, run YOLO patterns, pull news (optional), and generate a forecast.")
 
             # ✅ Simple, stable tuple-based Chatbot
             chat = gr.Chatbot(
@@ -734,6 +770,7 @@ with gr.Blocks(title="FinGPT-M — Chat") as demo:
                         json_download_side = gr.DownloadButton("Download JSON")
                 with gr.Column(elem_classes=["shadow-card"]):
                     gr.Markdown("**Recent News**")
+                    news_toggle = gr.Checkbox(label="Pull recent news (Finnhub)", value=False)
                     news_table = gr.Dataframe(wrap=True)
 
     # State: list of (user, assistant) tuples
@@ -741,14 +778,14 @@ with gr.Blocks(title="FinGPT-M — Chat") as demo:
 
     # Wiring
     if _uses_mm:
-        def on_mm_submit_pairs(history_pairs, data):
+        def on_mm_submit_pairs(history_pairs, data, do_news):
             user_text = (data or {}).get("text") or ""
             user_files = (data or {}).get("files") or []
-            return chat_handle_turn_pairs(history_pairs, user_text, user_files)
+            return chat_handle_turn_pairs(history_pairs, user_text, user_files, do_news=do_news)
 
         mm.submit(
             fn=on_mm_submit_pairs,
-            inputs=[chat_state, mm],
+            inputs=[chat_state, mm, news_toggle],
             outputs=[chat, summary_out, sentiment_out, forecast_out, json_out, news_out, json_download],
         ).then(
             fn=lambda jo, df, jp: (gr.update(value=jo), df, jp),
@@ -760,12 +797,12 @@ with gr.Blocks(title="FinGPT-M — Chat") as demo:
             outputs=chat_state,
         )
     else:
-        def on_send_click_pairs(history_pairs, text, image):
-            return chat_handle_turn_pairs(history_pairs, text, [image] if image else None)
+        def on_send_click_pairs(history_pairs, text, image, do_news):
+            return chat_handle_turn_pairs(history_pairs, text, [image] if image else None, do_news=do_news)
 
         send.click(
             fn=on_send_click_pairs,
-            inputs=[chat_state, txt, img],
+            inputs=[chat_state, txt, img, news_toggle],
             outputs=[chat, summary_out, sentiment_out, forecast_out, json_out, news_out, json_download],
         ).then(
             fn=lambda jo, df, jp: (gr.update(value=jo), df, jp),
@@ -783,4 +820,4 @@ if __name__ == "__main__":
     print("CUDA available:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("GPU:", torch.cuda.get_device_name(0))
-    demo.launch(share=True, debug=True)
+    demo.queue().launch(share=True, debug=True)
