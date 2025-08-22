@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
 import sys
-sys.path.insert(0, r"D:\\LLM Downloads\\GitHub-repos\\FinGPT-M\\fingpt\\stock_chart_trends_analysis")
-
+sys.path.insert(0, r"/content/FinGPT-M/fingpt/stock_chart_trends_analysis")
 
 import torch
 import gradio as gr
@@ -21,16 +20,22 @@ from datetime import date, datetime, timedelta
 import nltk
 from nltk.corpus import stopwords
 
-# --- LLM/PEFT imports ---
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+# ─────────────────────────────────────────────────────────────
+# NEW: HF Transformers + PEFT (replaces OpenAI GPT calls)
+# ─────────────────────────────────────────────────────────────
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from peft import PeftModel
 
 from StockChart_Trend_Prediction import StockChartTrendPredictor, StockChartMetadataExtractor
 import finance_rag_semantic as frs
 
-
 # --- ENV & setup ---
 load_dotenv(override=True)
+
+# Hugging Face token (required to pull LLaMA-2)
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    raise RuntimeError("HF_TOKEN not set (required to load meta-llama model).")
 
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
 if not FINNHUB_KEY:
@@ -38,7 +43,7 @@ if not FINNHUB_KEY:
 
 YOLO_WEIGHTS = os.getenv(
     "YOLO_WEIGHTS",
-    r"D:\\LLM Downloads\\GitHub-repos\\FinGPT-M\\fingpt\\stock_chart_trends_analysis\\best.pt"
+    r"/content/FinGPT-M/fingpt/stock_chart_trends_analysis/best.pt"
 )
 os.environ["YOLO_MODEL_PATH"] = YOLO_WEIGHTS
 os.environ["ULTRALYTICS_VERBOSE"] = "False"
@@ -51,45 +56,46 @@ EN_STOP = set(stopwords.words("english"))
 EN_STOP.update({"buy", "sell", "hold", "call", "put", "usd", "nse", "bse", "nyse", "nasdaq", "market", "stock", "shares"})
 
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
-# Remove OPENAI_MODEL variable if present
-
-
-# --- LLM Forecaster (PEFT/LLAMA) ---
-USE_GENERATIVE_FORECASTER = True  # flip to False if you want to skip the LLM step
-model, tokenizer, streamer = None, None, None
-if USE_GENERATIVE_FORECASTER:
-    try:
-        access_token = os.getenv("HF_TOKEN")
-        base_model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-2-7b-chat-hf",
-            token=access_token,
-            cache_dir="E:/FinGPT/llama_cache",
-            trust_remote_code=True,
-            device_map="cpu",               # keep CPU-safe; move to "auto" if you have GPU
-            torch_dtype=torch.float16,
-            offload_folder="offload/"
-        )
-        model = PeftModel.from_pretrained(
-            base_model,
-            "FinGPT/fingpt-forecaster_dow30_llama2-7b_lora",
-            offload_folder="E:/FinGPT/offload/",
-            cache_dir="E:/FinGPT/llama_cache"
-        ).eval()
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-2-7b-chat-hf",
-            token=access_token
-        )
-        streamer = TextStreamer(tokenizer)
-    except Exception as e:
-        print("⚠️ Could not initialize LLM forecaster. Falling back to rule-based summary only.\n", e)
-        USE_GENERATIVE_FORECASTER = False
 
 # --- Constants ---
 OUTPUT_BEGIN = "[OUTPUT_BEGIN]"
 OUTPUT_END = "[OUTPUT_END]"
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 DOC_EXT = {".pdf", ".docx", ".txt", ".md", ".csv", ".html", ".htm", ".pptx"}
+
+# ─────────────────────────────────────────────────────────────
+# LLM: Load Base + LoRA (FinGPT) and Tokenizer
+# ─────────────────────────────────────────────────────────────
+device_map = "auto"
+dtype = torch.float16
+
+print("• Loading base model…")
+base_model = AutoModelForCausalLM.from_pretrained(
+    'meta-llama/Llama-2-7b-chat-hf',
+    token=HF_TOKEN,
+    cache_dir="FinGPT/llama_cache",
+    trust_remote_code=True,
+    device_map=device_map,
+    torch_dtype=dtype,
+    offload_folder="FinGPT/offload/"
+)
+
+print("• Applying FinGPT LoRA adapter…")
+model = PeftModel.from_pretrained(
+    base_model,
+    'FinGPT/fingpt-forecaster_dow30_llama2-7b_lora',
+    offload_folder="FinGPT/offload/",
+    cache_dir="FinGPT/llama_cache"
+).eval()
+
+print("• Loading tokenizer…")
+tokenizer = AutoTokenizer.from_pretrained(
+    'meta-llama/Llama-2-7b-chat-hf',
+    token=HF_TOKEN
+)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
 # --- Helpers ---
 def _between_markers(text: str) -> str:
@@ -160,6 +166,7 @@ def _prefer_first_uppercase_token(U: str) -> Optional[str]:
         return t
     return None
 
+# (De-duplicated definition retained for compatibility)
 def finnhub_lookup_ticker_by_name(name_query: str) -> Optional[str]:
     try:
         res = finnhub_client.symbol_lookup(name_query)
@@ -237,17 +244,19 @@ def news_for_window(symbol: str, anchor_day: str, weeks: int = 1):
     return get_company_news(symbol, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
 
 def simple_sentiment_from_patterns(preds: List[Dict[str, Any]]) -> str:
-    print("[DEBUG] Predictions received for sentiment analysis:", preds)
     bullish = {"morning_star_rise","hammer","bullish_engulfing","ascending_triangle","golden_cross"}
     bearish = {"evening_star_fall","shooting_star","bearish_engulfing","descending_triangle","death_cross"}
     score = sum(1 for p in preds if any(b in p.get("class","").lower() for b in bullish)) - \
-        sum(1 for p in preds if any(b in p.get("class","").lower() for b in bearish))
-    print(f"[DEBUG] Sentiment score: {score}")
+            sum(1 for p in preds if any(b in p.get("class","").lower() for b in bearish))
     return "Positive" if score > 0 else "Negative" if score < 0 else "Neutral"
 
-# --- LLM wrapper (OpenAI Chat Completions) ---
+# ─────────────────────────────────────────────────────────────
+# LLM wrappers (Hugging Face model instead of OpenAI)
+# ─────────────────────────────────────────────────────────────
+def _apply_chat_template(system_prompt: str, user_prompt: str) -> str:
+    # Llama-2 style chat prompt with system section
+    return f"<s>[INST] <<SYS>>\n{system_prompt.strip()}\n<</SYS>>\n\n{user_prompt.strip()} [/INST]"
 
-# --- LLM wrapper (PEFT/LLAMA) ---
 def llm_generate(system_prompt: str,
                  user_prompt: str,
                  max_new_tokens: int = 500,
@@ -255,23 +264,46 @@ def llm_generate(system_prompt: str,
                  top_p: float = 0.95,
                  stop: Optional[List[str]] = None) -> str:
     """
-    Thin wrapper over PEFT/LLAMA model returning generated text.
+    Wrapper over HF + LoRA (FinGPT) model.
     """
-    if not USE_GENERATIVE_FORECASTER or model is None or tokenizer is None:
-        return "[LLM forecaster unavailable. Falling back to rule-based summary only.]"
-    prompt = system_prompt.strip() + "\n" + user_prompt.strip()
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
-    # Try to return only the new generated part after the prompt
-    return decoded[len(prompt):].strip() if decoded.startswith(prompt) else decoded.strip()
+    full_prompt = _apply_chat_template(system_prompt, user_prompt)
+    inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        do_sample=True,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        streamer=streamer
+    )
+
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Try to remove the prompt if it appears in the decoded text
+    return decoded.replace(full_prompt, "").strip()
+
+def generate_text(user_prompt: str,
+                  max_new_tokens: int = 400,
+                  temperature: float = 0.2,
+                  top_p: float = 0.95) -> str:
+    full_prompt = f"<s>[INST] {user_prompt.strip()} [/INST]"
+    inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        do_sample=True,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        streamer=streamer
+    )
+
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return decoded.replace(full_prompt, "").strip()
 
 # --- Chart & text handlers ---
 def llm_brief_summary(final_output: Dict[str, Any], sentiment: str, mode: str = "image") -> str:
@@ -287,22 +319,20 @@ def llm_brief_summary(final_output: Dict[str, Any], sentiment: str, mode: str = 
     title = "### Chart Summary" if mode == "image" else "### Text Query Summary"
     system = (
         "You are a precise market assistant. Using ONLY the provided JSON, "
-        "return EXACTLY 5 concise markdown bullets. Each bullet must start with '- ' and be a full sentence, not just a label or one-word answer. "
-        "Each sentence should clearly state the information, e.g., 'The ticker is INTU.' or 'The price range for the period was $575.00 to $650.00.' "
-        "Use the following fields if available: ticker, company_name, price_range, ohlc (for current price and volume), and pattern_sentiment."
+        "return EXACTLY 5 concise markdown bullets. Each bullet must start with '- ' "
+        "and include a bold label followed by a short fact."
     )
-    # Compose a user prompt with explicit field mapping for LLM
     user = (
         f"[JSON]\n{json.dumps(ctx, indent=2)}\n\n"
         f"{OUTPUT_BEGIN}\n"
-        f"- The ticker is <ticker>.\n"
-        f"- The company name is <company_name>.\n"
-        f"- The price range for the period was <price_range>.\n"
-        f"- The current price is <ohlc.C> and the market volume is <ohlc.V>.\n"
-        f"- The overall chart sentiment is <pattern_sentiment>.\n"
+        f"- **Label**: point\n"
+        f"- **Label**: point\n"
+        f"- **Label**: point\n"
+        f"- **Label**: point\n"
+        f"- **Label**: point\n"
         f"{OUTPUT_END}"
     )
-    raw = llm_generate(system, user, max_new_tokens=320, temperature=0.2, top_p=0.95, stop=[OUTPUT_END])
+    raw = llm_generate(system, user, max_new_tokens=280, temperature=0.2, top_p=0.95, stop=[OUTPUT_END])
     bullets = [ln.strip() for ln in _between_markers(raw).splitlines() if ln.strip().startswith("- ")]
     return title + "\n" + "\n".join(bullets)
 
@@ -517,8 +547,16 @@ def format_sources_for_display(sources):
         for s in sources
     ) if sources else ""
 
-
-# Remove generate_text or update to use llm_generate if needed
+def generate_text_with_context(question: str, context: str,
+                               max_new_tokens: int = 420,
+                               temperature: float = 0.2) -> str:
+    sys_msg = "You are a precise financial analyst. Answer factually, using only the given context."
+    qa_prompt = (
+        "Use ONLY the provided context. If the answer is not in the context, say you cannot find it. "
+        "Be specific and include figures with units and dates when available.\n\n"
+        f"Question:\n{question}\n\nContext:\n{context}\n\nAnswer:"
+    )
+    return llm_generate(sys_msg, qa_prompt, max_new_tokens=max_new_tokens, temperature=temperature)
 
 def _yf_symbol(ticker: str, exchange: Optional[str] = None) -> str:
     # simple passthrough for now; extend if you need NSE/BSE suffixing
@@ -596,18 +634,7 @@ def handle_user_turn(history_pairs, user_text, user_files, rag_sessions, do_news
         if rag_sessions and not explicit_ticker:
             ret = retrieve_across_sessions(user_text, rag_sessions, top_k=frs.TOP_K)
             ctx, sources = ret["context"], ret["sources"]
-            qa_prompt = (
-                "You are a diligent financial analyst. Use ONLY the provided context. "
-                "If the answer is not explicitly in the context, say you cannot find it. "
-                "Be specific and include figures with units and dates when available.\n\n"
-                f"Question:\n{user_text}\n\nContext:\n{ctx}\n\nAnswer:"
-            )
-            ans = llm_generate(
-                "You are a precise financial analyst. Answer factually, using only the given context.",
-                qa_prompt,
-                max_new_tokens=420,
-                temperature=0.2
-            )
+            ans = generate_text_with_context(user_text, ctx, max_new_tokens=420, temperature=0.2)
             srcs = format_sources_for_display(sources)
             if srcs:
                 ans += f"\n\n---\n{srcs}"
@@ -615,7 +642,6 @@ def handle_user_turn(history_pairs, user_text, user_files, rag_sessions, do_news
 
         # 2b) Else if explicit (TICKER) was given, do market pipeline (yfinance + forecast)
         elif explicit_ticker:
-            # build final_output from the text, but **force** the explicit ticker & date
             final_output = ensure_final_output_from_text(user_text)
             final_output["ticker"] = explicit_ticker
             if day:
@@ -631,7 +657,6 @@ def handle_user_turn(history_pairs, user_text, user_files, rag_sessions, do_news
         else:
             resolved = finnhub_lookup_ticker_by_name(company_hint or user_text)
             if resolved:
-                # run market with resolved ticker
                 query_for_builder = f"{resolved} ({day})" if day else resolved
                 final_output = ensure_final_output_from_text(query_for_builder)
                 final_output["ticker"] = resolved
@@ -653,9 +678,8 @@ def handle_user_turn(history_pairs, user_text, user_files, rag_sessions, do_news
     return history_pairs, last_summary_md, last_sentiment, last_forecast_md, last_json_str, last_news_df, last_json_path
 
 # --- UI ---
-with gr.Blocks(title="Unified Finance Chatbot (OpenAI)") as demo:
+with gr.Blocks(title="Unified Finance Chatbot (FinGPT LoRA - LLaMA-2)") as demo:
     chat = gr.Chatbot(label=None, height=520, show_copy_button=True, bubble_full_width=False)
-    # Note: depending on your Gradio version, MultimodalTextbox signature may vary.
     mm = gr.MultimodalTextbox(
         placeholder="Ask a question, drop a chart image, or upload a document...",
         show_label=False,
