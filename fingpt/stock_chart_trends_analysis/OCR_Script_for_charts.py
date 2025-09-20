@@ -1,4 +1,5 @@
 import os
+import requests
 import re
 import cv2
 import json
@@ -9,8 +10,30 @@ import holidays
 import warnings
 from collections import OrderedDict
 import numpy as np
+import yfinance as yf
+
+FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "d1ju9e9r01ql1h39gkl0d1ju9e9r01ql1h39gklg")
 
 class StockChartMetadataExtractor:
+    def fetch_latest_news_finnhub(self, ticker, api_key, max_articles=7):
+        """Fetch latest news for a given ticker from Finnhub."""
+        url = f"https://finnhub.io/api/v1/company-news"
+        from datetime import datetime, timedelta
+        today = datetime.today()
+        last_week = today - timedelta(days=7)
+        params = {
+            'symbol': ticker,
+            'from': last_week.strftime('%Y-%m-%d'),
+            'to': today.strftime('%Y-%m-%d'),
+            'token': api_key
+        }
+        resp = requests.get(url, params=params)
+        if resp.status_code == 200:
+            news_data = resp.json()
+            return news_data[:max_articles]
+        else:
+            print(f"Error fetching news for {ticker}: {resp.status_code}")
+            return []
 
     def debug_draw_ocr_boxes(self, ocr_results, save_path=None, show_labels=True):
         """
@@ -540,6 +563,10 @@ class StockChartMetadataExtractor:
         else:
             exchanges_pattern = self.EXCHANGES
 
+        def strip_numbers(s):
+            # Remove leading/trailing numbers, dots, and spaces
+            return re.sub(r"^[\d.,\s$₹€£¥]+|[\d.,\s$₹€£¥]+$", "", s).strip()
+
         for i, t in enumerate(texts):
             t = t.strip()
             if not self.is_probably_company_name(t):
@@ -547,35 +574,29 @@ class StockChartMetadataExtractor:
 
             t_clean = re.sub(r'\s+', ' ', t)
 
-            # Match company name followed by exchange acronym
             m = re.match(rf"^(.+?)\s+{exchanges_pattern}\b", t_clean, re.IGNORECASE)
             if m:
-                return m.group(1).strip()
+                return strip_numbers(m.group(1))
 
-            # Match company name with separators and exchange acronym
             m = re.match(rf"^([A-Za-z0-9 &.,'\-]+)\s+(?:[·\-\.\|]| {{2,}})\s+{exchanges_pattern}", t_clean, re.IGNORECASE)
             if m:
-                return m.group(1).strip()
+                return strip_numbers(m.group(1))
 
-            # Match company name with ticker in parentheses
             m = re.match(r"^(.+?)\s+\(\s*([A-Z]{1,6}(?::[A-Z]{1,6})?)\s*\)$", t_clean)
             if m:
-                return m.group(1).strip()
+                return strip_numbers(m.group(1))
 
-            # Match uppercase company names with keywords like LTD, INC, etc.
             if t_clean.isupper() and any(word in t_clean for word in ["LTD", "INC", "CORP", "PLC"]):
-                return t_clean.strip()
+                return strip_numbers(t_clean)
 
-            # Match company name followed by ticker or other patterns
             m = re.match(r"^([A-Za-z0-9 &.,'\-]+)\s+\(([A-Z0-9]{1,10})\)$", t_clean)
             if m:
-                return m.group(1).strip()
+                return strip_numbers(m.group(1))
 
-            # Check next line for exchange acronym or ticker
             if i + 1 < len(texts):
                 next_line = texts[i + 1].strip()
                 if re.search(rf"\b{exchanges_pattern}\b", next_line, re.IGNORECASE) or re.match(r"\(([A-Z0-9]{1,10})\)", next_line):
-                    return t_clean
+                    return strip_numbers(t_clean)
 
         return None
 
@@ -625,10 +646,6 @@ class StockChartMetadataExtractor:
                 if ticker not in self.EXCHANGES and ticker not in self.CURRENCIES and not is_garbage(ticker):
                     return {"ticker": ticker, "company_name": None}
                 continue
-
-        # If no valid ticker found, fallback to N/A
-        company_name = self.extract_company_name(texts)
-        return {"ticker": "N/A", "company_name": company_name}
 
         # If no valid ticker found, fallback to N/A
         company_name = self.extract_company_name(texts)
@@ -760,12 +777,41 @@ class StockChartMetadataExtractor:
             metadata = self.parse_chart_metadata(raw_texts, x_axis_texts=None, ocr_results=results)
         return metadata
 
+    def get_ticker(self, company_name):
+        url = "https://query2.finance.yahoo.com/v1/finance/search"
+        params = {"q": company_name, "quotes_count": 1, "country": "United States"}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, params=params, headers=headers)
+        data = res.json()
+        ticker = data['quotes'][0]['symbol']
+        return ticker
 
     def save_metadata_to_json(self, filename):
-        path = "output/"+filename
+        path = "output/" + filename
         if not os.path.exists("output"):
             os.makedirs("output")
         metadata = self.extract_metadata()
+        API_KEY = FINNHUB_KEY
+        ticker = metadata.get('ticker')
+        company_name = metadata.get('company_name')
+        news = []
+        resolved_ticker = ticker
+        if (not ticker or ticker == "N/A") and company_name and company_name != "N/A":
+            # Try to resolve ticker using company name via yfinance
+            print(f"Ticker not found; resolving ticker using company name '{company_name}'.")
+            try:
+                symbol = self.get_ticker(company_name)
+                ticker_info = yf.Ticker(symbol).info
+                resolved_ticker = ticker_info.get("symbol") or ticker_info.get("ticker")
+                if not resolved_ticker:
+                    print(f"Could not resolve ticker for company name '{company_name}'.")
+            except Exception as e:
+                print(f"Error resolving ticker for company name '{company_name}': {e}")
+        if resolved_ticker and resolved_ticker != "N/A":
+            news = self.fetch_latest_news_finnhub(resolved_ticker, API_KEY)
+        else:
+            print("Neither ticker nor company name could resolve a valid ticker; news fetching skipped.")
+        metadata['latest_news'] = news
         with open(filename, 'w') as f:
             json.dump(metadata, f, indent=4)
         print(f"Metadata saved to {filename}")
